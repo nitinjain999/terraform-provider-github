@@ -168,10 +168,14 @@ func resourceGithubRepositoryPagesCreate(ctx context.Context, d *schema.Resource
 		return diag.FromErr(err)
 	}
 
+	// Capture desired values from config BEFORE d.Set calls overwrite them with the
+	// API response. EnablePages returns cname=null for a new site, which would cause
+	// d.GetOk("cname") to return false further down and send cname=null in the update.
+	desiredCname := d.Get("cname").(string)
+	desiredPublic, hasPublic := d.GetOkExists("public")         //nolint:staticcheck // SA1019: d.GetOkExists is deprecated but necessary for bool fields
+	_, hasHTTPSEnforced := d.GetOkExists("https_enforced") //nolint:staticcheck // SA1019: d.GetOkExists is deprecated but necessary for bool fields
+
 	if err := d.Set("build_type", pages.GetBuildType()); err != nil {
-		return diag.FromErr(err)
-	}
-	if err := d.Set("cname", pages.GetCNAME()); err != nil {
 		return diag.FromErr(err)
 	}
 	if err := d.Set("custom_404", pages.GetCustom404()); err != nil {
@@ -188,46 +192,40 @@ func resourceGithubRepositoryPagesCreate(ctx context.Context, d *schema.Resource
 	}
 
 	// Sending a null value will remove the custom domain in the API, so we make sure to only send the value if it's set.
-	cname, cnameOK := d.GetOk("cname")
-	// // Sending the `public` value will return an error if the repository doesn't have public pages enabled.
-	public, publicOKExists := d.GetOkExists("public") //nolint:staticcheck // SA1019: d.GetOkExists is deprecated but necessary for bool fields
-	// `https_enforced` can't be sent to the API unless `cname` is set. Otherwise the API will return "404 The certificate does not exist yet".
-	httpsEnforced, httpsEnforcedExists := d.GetOkExists("https_enforced") //nolint:staticcheck // SA1019: d.GetOkExists is deprecated but necessary for bool fields
-	tflog.Debug(ctx, "Do we have values set that need the update logic?", map[string]any{
-		"public":                public,
-		"public_ok_exists":      publicOKExists,
-		"https_enforced":        httpsEnforced,
-		"https_enforced_exists": httpsEnforcedExists,
-		"cname":                 cname,
-		"cname_ok":              cnameOK,
-	})
-
-	if cnameOK || publicOKExists || httpsEnforcedExists {
-		update := &github.PagesUpdate{}
-
-		if cnameOK {
-			update.CNAME = new(cname.(string))
+	// https_enforced cannot be sent together with cname on a newly created site — GitHub returns
+	// "404 The certificate does not exist yet" because no TLS cert has been provisioned yet.
+	// Set cname (and public) first; https_enforced will be applied by a subsequent Update once the cert exists.
+	if desiredCname != "" || hasPublic {
+		update := &github.PagesUpdate{
+			CNAME: &desiredCname,
 		}
-
-		if publicOKExists {
-			update.Public = new(public.(bool))
+		if hasPublic {
+			public := desiredPublic.(bool)
+			update.Public = &public
 		}
-
-		if httpsEnforcedExists {
-			update.HTTPSEnforced = new(httpsEnforced.(bool))
-		}
-
+		tflog.Debug(ctx, "Applying post-create update for cname/public", map[string]any{
+			"cname":      desiredCname,
+			"has_public": hasPublic,
+		})
 		_, err = client.Repositories.UpdatePages(ctx, owner, repoName, update)
 		if err != nil {
 			return diag.FromErr(err)
 		}
+		if err := d.Set("cname", desiredCname); err != nil {
+			return diag.FromErr(err)
+		}
+	} else {
+		if err := d.Set("cname", pages.GetCNAME()); err != nil {
+			return diag.FromErr(err)
+		}
 	}
-	if !publicOKExists {
+
+	if !hasPublic {
 		if err := d.Set("public", pages.GetPublic()); err != nil {
 			return diag.FromErr(err)
 		}
 	}
-	if !httpsEnforcedExists {
+	if !hasHTTPSEnforced {
 		if err := d.Set("https_enforced", pages.GetHTTPSEnforced()); err != nil {
 			return diag.FromErr(err)
 		}
@@ -314,12 +312,11 @@ func resourceGithubRepositoryPagesUpdate(ctx context.Context, d *schema.Resource
 	owner := meta.name // TODO: Add owner support // d.Get("owner").(string)
 	repoName := d.Get("repository").(string)
 
-	update := &github.PagesUpdate{}
-
-	// Sending a null value for `cname` will remove the custom domain in the API, so we make sure to only send the value if it's changed.
-	if d.HasChange("cname") {
-		cname := d.Get("cname").(string)
-		update.CNAME = new(cname)
+	// PagesUpdate.CNAME has no omitempty — a nil/null value removes the custom domain.
+	// Always send the current cname value so an update to another field doesn't wipe it.
+	currentCname := d.Get("cname").(string)
+	update := &github.PagesUpdate{
+		CNAME: &currentCname,
 	}
 
 	// Sending the `public` value on updates will return an error if the repository doesn't have public pages enabled.
@@ -330,7 +327,8 @@ func resourceGithubRepositoryPagesUpdate(ctx context.Context, d *schema.Resource
 		update.Public = new(public)
 	}
 
-	// `https_enforced` can't be sent to the API unless `cname` is set. Otherwise the API will return "404 The certificate does not exist yet".
+	// `https_enforced` can't be sent to the API unless `cname` is set and the TLS cert has been provisioned.
+	// Otherwise the API returns "404 The certificate does not exist yet".
 	if d.HasChange("https_enforced") {
 		httpsEnforced := d.Get("https_enforced").(bool)
 		update.HTTPSEnforced = new(httpsEnforced)
